@@ -77,7 +77,7 @@ async function sendDailyTip(phone, name, week, conditions) {
       : `Daily pregnancy tip for ${name || 'a pregnant woman'} at week ${week} of pregnancy. Health conditions: ${conditions || 'none'}. Topic: ${todayTopic}. Include one specific fact about week ${week}, one practical tip related to today's topic, and one action she can take today. Keep it warm and under 5 lines.`
 
     const completion = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
+      model: 'openai/gpt-oss-120b',
       messages: [
         {
           role: 'system',
@@ -245,7 +245,7 @@ function startScheduler() {
 async function detectRisk(userMessage, userName, weeksPregnant) {
   try {
     const result = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
+      model: 'openai/gpt-oss-120b',
       messages: [
         {
           role: 'system',
@@ -292,7 +292,7 @@ NO = safe to handle normally.`
 async function extractProfileData(conversation) {
   try {
     const result = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
+      model: 'openai/gpt-oss-120b',
       messages: [
         {
           role: 'system',
@@ -479,7 +479,7 @@ app.post('/webhook', async (req, res) => {
   const [danger, completion] = await Promise.all([
     detectRisk(userMessage, session.name, session.weeksPregnant),
     groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
+      model: 'openai/gpt-oss-120b',
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         ...session.messages
