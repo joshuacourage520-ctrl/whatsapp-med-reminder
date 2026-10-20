@@ -30,6 +30,13 @@ const PLANS = {
 }
 const TIPS_PRO_ONLY = false        // true = daily tips only for Pro and trial users
 const MAX_MESSAGES_PER_DAY = 80    // per phone number, protects your AI bill
+const ONLINE_PAYMENTS = false      // false = bank transfer only. Set true later if Paystack goes live
+const PREMIUM_OPEN = true          // true = Premium can be bought. false = waitlist only
+const BANK = {
+  bank: process.env.BANK_NAME || 'United Bank for Africa (UBA)',
+  accountName: process.env.BANK_ACCOUNT_NAME || 'MAMAPLUS TECHNOLOGIES LTD',
+  accountNumber: process.env.BANK_ACCOUNT_NUMBER || '1031617872'
+}
 // ===========================================================
 
 const DAY = 24 * 60 * 60 * 1000
@@ -37,6 +44,7 @@ const sessions = {}
 const dirty = new Set()
 const mediaReplied = new Map()  // phone -> date we last told her we only read text
 const nurseWindow = new Map()   // phone -> time (ms) until we treat her as a nurse applicant
+const payWindow = new Map()     // phone -> time (ms) until we treat her photos as payment receipts
 const NURSE_WINDOW_HOURS = 72
 
 // ---------------- small helpers ----------------
@@ -51,8 +59,11 @@ function fmtDate(d) {
   return new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Africa/Lagos' })
 }
 function markDirty(phone) { dirty.add(phone) }
-const proActive = s => s.plan === 'pro' && s.planEnd && Date.parse(s.planEnd) > Date.now()
-const trialActive = s => s.plan !== 'pro' && s.trialEnd && Date.parse(s.trialEnd) > Date.now()
+const isPaidPlan = s => s.plan === 'pro' || s.plan === 'premium'
+const proActive = s => isPaidPlan(s) && s.planEnd && Date.parse(s.planEnd) > Date.now()
+const trialActive = s => !isPaidPlan(s) && s.trialEnd && Date.parse(s.trialEnd) > Date.now()
+const planName = s => (s.plan === 'premium' ? 'Premium' : 'Pro')
+const tierName = t => (t === 'premium' ? 'Premium' : 'Pro')
 
 function newSession(extra = {}) {
   return Object.assign({
@@ -335,7 +346,10 @@ const PLAN_MENU =
   `Here are the MamaPlus plans 💚\n\n` +
   `1. 14-Day Trial: free. Daily check-ins, danger-sign support, medication and antenatal reminders, and meet a licensed nurse.\n\n` +
   `2. Pro: ${naira(PLANS.pro.monthly)} a month or ${naira(PLANS.pro.yearly)} a year. Everything in the trial, plus live nurse voice access and tips for your pregnancy week.\n\n` +
-  `3. Premium (coming soon): ${naira(PLANS.premium.monthly)} a month or ${naira(PLANS.premium.yearly)} a year. A verified drug wallet for you and your baby. Reply 3 to join the waitlist.\n\n` +
+  (PREMIUM_OPEN
+    ? `3. Premium: ${naira(PLANS.premium.monthly)} a month or ${naira(PLANS.premium.yearly)} a year. Everything in Pro, plus a verified drug wallet for you and your baby. Reply 3 to get Premium.\n\n`
+    : `3. Premium (coming soon): ${naira(PLANS.premium.monthly)} a month or ${naira(PLANS.premium.yearly)} a year. A verified drug wallet for you and your baby. Reply 3 to join the waitlist.\n\n`) +
+  `Payment is by bank transfer.\n\n` +
   `Reply 1, 2 or 3.`
 
 function emergencyMessage(alerted) {
@@ -555,6 +569,20 @@ async function askConsent(phone, session) {
 }
 
 // ---------------- plans and payment ----------------
+function bankDetailsText(phone, amount, label) {
+  payWindow.set(phone, Date.now() + 24 * 60 * 60 * 1000)
+  return (
+    `We currently accept payment by bank transfer only 💚\n\n` +
+    `Amount: ${naira(amount)} (${label})\n\n` +
+    `🏦 Bank: ${BANK.bank}\n` +
+    `👤 Account name: ${BANK.accountName}\n` +
+    `🔢 Account number: ${BANK.accountNumber}\n\n` +
+    `After you pay, send a screenshot of your receipt here, or reply PAID. ` +
+    `Our team will confirm and activate your plan, usually within a few hours.\n\n` +
+    `Please check that the account name above matches before you send.`
+  )
+}
+
 async function startTrial(phone, session) {
   if (session.trialStart) {
     if (trialActive(session)) await say(phone, session, `Your free trial is active until ${fmtDate(session.trialEnd)}. Reply PRO to continue after that.`)
@@ -574,27 +602,36 @@ async function startTrial(phone, session) {
   else if (!session.onboardingComplete) await aiReply(phone, session, 'Hi')
 }
 
-async function startPro(phone, session, lower) {
+async function startPro(phone, session, lower, tier = 'pro') {
   const period = /year|annual/.test(lower) ? 'yearly' : /month/.test(lower) ? 'monthly' : null
-  if (period) return createAndSendPayment(phone, session, period)
+  if (period) return createAndSendPayment(phone, session, period, tier)
   session.flow = 'billing'
   session.flowAt = Date.now()
+  session.flowData = { tier }
   markDirty(phone)
-  const active = proActive(session) ? `Your Pro plan is active until ${fmtDate(session.planEnd)}. Paying now adds more time.\n\n` : ''
+  const P = PLANS[tier]
+  const active = proActive(session) ? `Your ${planName(session)} plan is active until ${fmtDate(session.planEnd)}. Paying now adds more time.\n\n` : ''
+  const blurb = tier === 'premium'
+    ? `MamaPlus Premium includes everything in Pro plus a verified drug wallet.\n\n`
+    : `MamaPlus Pro includes live nurse voice access and tips for your pregnancy week.\n\n`
   await say(phone, session,
-    `${active}MamaPlus Pro includes live nurse voice access and tips for your pregnancy week.\n\n` +
-    `How would you like to pay?\n1. Monthly: ${naira(PLANS.pro.monthly)}\n2. Yearly: ${naira(PLANS.pro.yearly)} (saves ${naira(PLANS.pro.monthly * 12 - PLANS.pro.yearly)})\n\nReply 1 or 2.`)
+    `${active}${blurb}` +
+    `How would you like to pay?\n1. Monthly: ${naira(P.monthly)}\n2. Yearly: ${naira(P.yearly)} (saves ${naira(P.monthly * 12 - P.yearly)})\n\nReply 1 or 2.`)
 }
 
-async function createAndSendPayment(phone, session, period) {
+async function createAndSendPayment(phone, session, period, tier = 'pro') {
   session.flow = null
+  session.flowData = null
   markDirty(phone)
-  const amount = PLANS.pro[period]
-  if (!process.env.PAYSTACK_SECRET_KEY) {
-    await say(phone, session, `Online payment is not available right now. I have asked our team to help you, and they will message you shortly.`)
-    await notifyStaff(`💳 Payment request (Paystack not set up)\nPhone: +${phone}\nPlan: Pro ${period} (${naira(amount)})`)
+  const amount = PLANS[tier][period]
+  const label = `MamaPlus ${tierName(tier)}, ${period}`
+
+  if (!ONLINE_PAYMENTS || !process.env.PAYSTACK_SECRET_KEY) {
+    await say(phone, session, bankDetailsText(phone, amount, label))
+    await notifyStaff(`💳 ${tier.toUpperCase()} payment request (bank transfer)\nPatient: ${session.name || 'Unknown'}\nPhone: +${phone}\nPlan: ${tier} ${period} (${naira(amount)})\nWatch your bank app for this amount.`)
     return
   }
+
   const reference = `MP-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`
   const email = session.email || `${phone}@mamaplus.ng`
   try {
@@ -603,24 +640,24 @@ async function createAndSendPayment(phone, session, period) {
       headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         email, amount: amount * 100, currency: 'NGN', reference,
-        metadata: { phone, plan: 'pro', period }
+        metadata: { phone, plan: tier, period }
       })
     })
     const data = await res.json()
     if (!data.status) throw new Error(data.message || 'Paystack refused')
     await payStore.save({
-      reference, phone, plan: 'pro', period, amount_kobo: amount * 100,
+      reference, phone, plan: tier, period, amount_kobo: amount * 100,
       status: 'pending', created_at: new Date().toISOString()
     })
     session.payNudge = { reference, at: Date.now() + DAY }
     markDirty(phone)
     await say(phone, session,
-      `Here is your secure Paystack link for MamaPlus Pro (${period}, ${naira(amount)}):\n${data.data.authorization_url}\n\n` +
+      `Here is your secure Paystack link for ${label.replace(', ', ' (')}, ${naira(amount)}):\n${data.data.authorization_url}\n\n` +
       `I will message you here as soon as your payment is confirmed. If you have any problem, reply HELP.`)
   } catch (e) {
     console.error('Payment creation failed:', e.message)
     await say(phone, session, `Sorry, I could not create your payment link. I have asked our team to help you.`)
-    await notifyStaff(`💳 Payment link FAILED\nPhone: +${phone}\nPlan: Pro ${period}\nError: ${e.message}`)
+    await notifyStaff(`💳 Payment link FAILED\nPhone: +${phone}\nPlan: ${tier} ${period}\nError: ${e.message}`)
   }
 }
 
@@ -652,24 +689,26 @@ async function confirmPayment(reference) {
   const phone = pay.phone
   if (!sessions[phone]) sessions[phone] = newSession()
   const s = sessions[phone]
+  const tier = pay.plan === 'premium' ? 'premium' : 'pro'
   const now = Date.now()
   const base = s.planEnd && Date.parse(s.planEnd) > now ? Date.parse(s.planEnd) : now
   const days = pay.period === 'yearly' ? 365 : 30
-  s.plan = 'pro'
+  s.plan = tier
   if (!s.planStart) s.planStart = new Date().toISOString()
   s.planEnd = new Date(base + days * DAY).toISOString()
   s.flow = null
   s.payNudge = null
+  payWindow.delete(phone)
   markDirty(phone)
   await say(phone, s,
-    `Payment received, thank you 💚 Your MamaPlus Pro plan is active until ${fmtDate(s.planEnd)}.\n` +
+    `Payment received, thank you 💚 Your MamaPlus ${tierName(tier)} plan is active until ${fmtDate(s.planEnd)}.\n` +
     `Reply NURSE any time to reach a nurse.`)
-  await notifyStaff(`✅ Pro payment received\nPhone: +${phone}\nPeriod: ${pay.period}\nRef: ${reference}`)
+  await notifyStaff(`✅ ${tierName(tier)} payment received\nPhone: +${phone}\nPeriod: ${pay.period}\nRef: ${reference}`)
   return { ok: true }
 }
 
 function statusText(s) {
-  if (proActive(s)) return `Your MamaPlus Pro plan is active until ${fmtDate(s.planEnd)}.`
+  if (proActive(s)) return `Your MamaPlus ${planName(s)} plan is active until ${fmtDate(s.planEnd)}.`
   if (trialActive(s)) {
     const left = Math.max(1, Math.ceil((Date.parse(s.trialEnd) - Date.now()) / DAY))
     return `Your free trial runs until ${fmtDate(s.trialEnd)} (${left} day${left === 1 ? '' : 's'} left). Reply PRO to continue after that.`
@@ -695,7 +734,7 @@ async function handleIntent(phone, session, intent, lower) {
         return
       }
       await say(phone, session,
-        `Here is your payment confirmation 💚\nPlan: MamaPlus Pro (${pay.period})\nAmount: ${naira(pay.amount_kobo / 100)}\nReference: ${pay.reference}\nPaid: ${fmtDate(pay.paid_at || pay.created_at)}` +
+        `Here is your payment confirmation 💚\nPlan: MamaPlus ${tierName(pay.plan)} (${pay.period})\nAmount: ${naira(pay.amount_kobo / 100)}\nReference: ${pay.reference}\nPaid: ${fmtDate(pay.paid_at || pay.created_at)}` +
         (session.planEnd ? `\nYour plan runs until ${fmtDate(session.planEnd)}.` : '') +
         `\nIf you need a formal receipt, I have asked our team to send it.`)
       return notifyStaff(`🧾 Receipt request\nPhone: +${phone}\nReference: ${pay.reference}`)
@@ -706,27 +745,30 @@ async function handleIntent(phone, session, intent, lower) {
     case 'trial':
       return startTrial(phone, session)
     case 'pro':
-      return startPro(phone, session, lower)
+      return startPro(phone, session, lower, proActive(session) && session.plan === 'premium' ? 'premium' : 'pro')
     case 'premium':
+      if (PREMIUM_OPEN) return startPro(phone, session, lower, 'premium')
       session.premiumWaitlist = true; session.flow = null; markDirty(phone)
       return say(phone, session,
         `You are on the Premium waitlist 💚 It is not open yet, so no payment is needed. Premium will include everything in Pro plus a verified drug wallet (${naira(PLANS.premium.monthly)} a month or ${naira(PLANS.premium.yearly)} a year). We will message you when it opens.`)
     case 'paid': {
       const pay = await payStore.latestPending(phone)
-      if (!pay) {
-        await say(phone, session, `I do not see a pending payment for this number. If you paid, please send your receipt here and our team will check.`)
-        return notifyStaff(`💳 Says paid but no pending payment\nPhone: +${phone}`)
+      if (pay) {
+        const r = await confirmPayment(pay.reference)
+        if (!r.ok) await say(phone, session, `I cannot see your payment yet. Banks can take a few minutes. Please wait 5 minutes and reply PAID again. If it still fails, reply HELP.`)
+        return
       }
-      const r = await confirmPayment(pay.reference)
-      if (!r.ok) {
-        await say(phone, session, `I cannot see your payment yet. Banks can take a few minutes. Please wait 5 minutes and reply PAID again. If it still fails, reply HELP.`)
-      }
-      return
+      // bank transfer: no automatic check, so staff confirm
+      payWindow.set(phone, Date.now() + 24 * 60 * 60 * 1000)
+      await say(phone, session,
+        `Thank you 💚 Please send a screenshot of your transfer receipt here so our team can confirm it. ` +
+        `Once confirmed, I will message you that your plan is active.`)
+      return notifyStaff(`💳 Says PAID (bank transfer)\nPatient: ${session.name || 'Unknown'}\nPhone: +${phone}\nCheck your bank app, then activate:\n/admin/activate?key=YOUR_KEY&phone=${phone}&tier=pro&period=monthly\n(change tier=premium or period=yearly if needed)`)
     }
     case 'cancel':
       await say(phone, session,
         `MamaPlus never charges you automatically. Your plan simply ends on its end date, and you pay again only if you choose. ` +
-        (proActive(session) ? `Your Pro plan stays active until ${fmtDate(session.planEnd)}. ` : '') +
+        (proActive(session) ? `Your ${planName(session)} plan stays active until ${fmtDate(session.planEnd)}. ` : '') +
         `If you need a refund, I have asked our team to contact you.`)
       return notifyStaff(`↩️ Cancel/refund request\nPhone: +${phone}\nPlan: ${session.plan}`)
     case 'status':
@@ -734,12 +776,12 @@ async function handleIntent(phone, session, intent, lower) {
     case 'nurse': {
       let text
       if (proActive(session)) {
-        text = `Your Pro plan includes live nurse voice access. ` + (process.env.NURSE_CONTACT ? process.env.NURSE_CONTACT : `I have told our team, and a nurse will contact you on this number.`)
+        text = `Your ${planName(session)} plan includes live nurse voice access. ` + (process.env.NURSE_CONTACT ? process.env.NURSE_CONTACT : `I have told our team, and a nurse will contact you on this number.`)
       } else if (trialActive(session)) {
         text = `During your trial, a MamaPlus nurse introduces herself to you. ` + (process.env.NURSE_INTRO || `Our team will message you shortly.`) +
-          `\n\nFor live nurse voice access, upgrade to Pro (${naira(PLANS.pro.monthly)} a month). Reply PRO.`
+          `\n\nFor live nurse voice access, upgrade to Pro (${naira(PLANS.pro.monthly)} a month). Reply PRO and I will send the bank details.`
       } else {
-        text = `A MamaPlus nurse is available with live voice access on our Pro plan (${naira(PLANS.pro.monthly)} a month). Reply PRO to start, or visit mamaplus.ng to find a nurse near you. I have also told our team.`
+        text = `Live nurse voice access is part of our Pro plan (${naira(PLANS.pro.monthly)} a month). Reply PRO and I will send the bank details. I have also told our team.`
       }
       await say(phone, session, text)
       return notifyStaff(`📞 Nurse request\nPatient: ${session.name || 'Unknown'}\nPhone: +${phone}\nPlan: ${session.plan}`)
@@ -813,14 +855,15 @@ async function handleFlow(phone, session, lower) {
   }
   if (session.flow === 'plan_menu') {
     if (lower === '1') { session.flow = null; await startTrial(phone, session); return true }
-    if (lower === '2') { await startPro(phone, session, ''); return true }
+    if (lower === '2') { await startPro(phone, session, '', 'pro'); return true }
     if (lower === '3') { await handleIntent(phone, session, 'premium', lower); return true }
     return false
   }
   if (session.flow === 'billing') {
-    if (/^(1|monthly|month)\b/.test(lower)) { await createAndSendPayment(phone, session, 'monthly'); return true }
-    if (/^(2|yearly|year|annual)\b/.test(lower)) { await createAndSendPayment(phone, session, 'yearly'); return true }
-    if (/^(no|cancel|stop|back)\b/.test(lower)) { session.flow = null; markDirty(phone); await say(phone, session, `No problem. Reply PLANS any time.`); return true }
+    const tier = (session.flowData && session.flowData.tier) === 'premium' ? 'premium' : 'pro'
+    if (/^(1|monthly|month)\b/.test(lower)) { await createAndSendPayment(phone, session, 'monthly', tier); return true }
+    if (/^(2|yearly|year|annual)\b/.test(lower)) { await createAndSendPayment(phone, session, 'yearly', tier); return true }
+    if (/^(no|cancel|stop|back)\b/.test(lower)) { session.flow = null; session.flowData = null; markDirty(phone); await say(phone, session, `No problem. Reply PLANS any time.`); return true }
     return false
   }
   return false
@@ -1189,7 +1232,10 @@ app.post('/webhook', async (req, res) => {
   const msgType = body.data?.type
   if (userPhone && ['image', 'video', 'ptt', 'audio', 'voice', 'document', 'sticker'].includes(msgType)) {
     res.sendStatus(200)
-    if ((nurseWindow.get(userPhone) || 0) > Date.now()) {
+    if ((payWindow.get(userPhone) || 0) > Date.now()) {
+      await notifyStaff(`🧾 Payment receipt (${msgType}) from +${userPhone}. Open the WhatsApp chat to view it, then activate her plan.`)
+      await sendWhatsAppMessage(userPhone, `Receipt received 💚 Our team will confirm and activate your plan shortly.`)
+    } else if ((nurseWindow.get(userPhone) || 0) > Date.now()) {
       await notifyNurseAdmin(`📎 Nurse applicant +${userPhone} sent a ${msgType}. Open the WhatsApp chat to view it.`)
     } else if (mediaReplied.get(userPhone) !== nigeriaNow().date) {
       mediaReplied.set(userPhone, nigeriaNow().date)
@@ -1250,7 +1296,7 @@ async function runUserSchedule(phone, s, date, hour) {
     s.payNudge = null
     markDirty(phone)
     if (pay && pay.status === 'pending') {
-      await sendWhatsAppMessage(phone, `Hi ${nm}, your payment link for MamaPlus Pro is still waiting. Reply PRO for a new link, or HELP if you need a hand.`)
+      await sendWhatsAppMessage(phone, `Hi ${nm}, your payment link for MamaPlus is still waiting. Reply PRO for a new link, or HELP if you need a hand.`)
     }
   }
 
@@ -1266,14 +1312,15 @@ async function runUserSchedule(phone, s, date, hour) {
         await sendWhatsAppMessage(phone, `Hi ${nm}, your free trial has ended. Reply PRO to continue with live nurse voice access and weekly tips.`)
       }
     }
-    if (s.plan === 'pro' && s.planEnd) {
+    if (isPaidPlan(s) && s.planEnd) {
       const left = Math.ceil((Date.parse(s.planEnd) - Date.now()) / DAY)
       if ((left === 3 || left === 1) && once(phone, s, `pro${left}`, date)) {
-        await sendWhatsAppMessage(phone, `Hi ${nm}, your MamaPlus Pro plan ends in ${left} day${left === 1 ? '' : 's'}. Reply PAY to renew.`)
+        await sendWhatsAppMessage(phone, `Hi ${nm}, your MamaPlus ${planName(s)} plan ends in ${left} day${left === 1 ? '' : 's'}. Reply PAY to renew.`)
       }
       if (left <= 0 && once(phone, s, 'proend', date)) {
+        const was = planName(s)
         s.plan = 'free'
-        await sendWhatsAppMessage(phone, `Hi ${nm}, your MamaPlus Pro plan has ended. Reply PAY to renew whenever you are ready.`)
+        await sendWhatsAppMessage(phone, `Hi ${nm}, your MamaPlus ${was} plan has ended. Reply PAY to renew whenever you are ready.`)
       }
     }
   }
@@ -1439,6 +1486,39 @@ app.post('/admin/import', async (req, res) => {
   res.send(importPage(req.query.key, '', `Saved ${fresh.length} users. Now open the stats page to see the totals.`))
 })
 
+// ---------------- manual activation after a bank transfer ----------------
+// Usage: /admin/activate?key=YOUR_ADMIN_KEY&phone=2348012345678&tier=pro&period=monthly
+app.get('/admin/activate', async (req, res) => {
+  if (!adminOk(req)) return res.sendStatus(401)
+  const phone = String(req.query.phone || '').replace(/\D/g, '')
+  const period = req.query.period === 'yearly' ? 'yearly' : 'monthly'
+  const tier = req.query.tier === 'premium' ? 'premium' : 'pro'
+  if (!phone) return res.status(400).send('phone missing')
+  if (!sessions[phone]) sessions[phone] = newSession()
+  const s = sessions[phone]
+  const now = Date.now()
+  const base = s.planEnd && Date.parse(s.planEnd) > now ? Date.parse(s.planEnd) : now
+  s.plan = tier
+  if (!s.planStart) s.planStart = new Date().toISOString()
+  s.planEnd = new Date(base + (period === 'yearly' ? 365 : 30) * DAY).toISOString()
+  s.flow = null
+  s.flowData = null
+  s.payNudge = null
+  payWindow.delete(phone)
+  markDirty(phone)
+  // keep a payment record so the RECEIPT command works for bank-transfer customers
+  try {
+    await payStore.save({
+      reference: `BANK-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+      phone, plan: tier, period, amount_kobo: PLANS[tier][period] * 100,
+      status: 'success', created_at: new Date().toISOString(), paid_at: new Date().toISOString()
+    })
+  } catch (e) { console.error('Could not save manual payment record:', e.message) }
+  await flushDirty()
+  await say(phone, s, `Payment confirmed, thank you 💚 Your MamaPlus ${tierName(tier)} plan is active until ${fmtDate(s.planEnd)}.\nReply NURSE any time to reach a nurse.`)
+  res.send(`Activated ${tierName(tier)} (${period}) for ${mask(phone)} until ${fmtDate(s.planEnd)}`)
+})
+
 // ---------------- counts only (no names or numbers) ----------------
 app.get('/stats', (req, res) => {
   if (!adminOk(req)) return res.sendStatus(401)
@@ -1451,7 +1531,8 @@ app.get('/stats', (req, res) => {
     active_last_7_days: all.filter(s => s.lastActive && Date.parse(s.lastActive) > weekAgo).length,
     came_back_on_2plus_days: all.filter(s => (s.activeDays || 0) >= 2).length,
     on_free_trial_now: all.filter(s => trialActive(s)).length,
-    paying_pro_now: all.filter(s => proActive(s)).length,
+    paying_pro_now: all.filter(s => proActive(s) && s.plan === 'pro').length,
+    paying_premium_now: all.filter(s => proActive(s) && s.plan === 'premium').length,
     premium_waitlist: all.filter(s => s.premiumWaitlist).length,
     restored_from_old_logs: all.filter(s => s.source === 'log_import').length
   })
